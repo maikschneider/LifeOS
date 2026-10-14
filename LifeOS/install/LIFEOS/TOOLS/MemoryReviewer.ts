@@ -342,8 +342,13 @@ export function readCurrentMemorySnapshot(): CurrentMemorySnapshot {
 
 function renderCurrentMemory(snap: CurrentMemorySnapshot | undefined): string[] {
   if (!snap) return [];
+  // A bare "consolidate" is ignored at the cap: the model swaps one for one. A
+  // concrete count it can hit works, and N−1 is the most the writer's erosion
+  // guard accepts in one write.
+  const full = (n: number) =>
+    ` — ≥80% FULL. Still record every new durable fact, but return EXACTLY ${n - 1} entries, not fewer (a list two or more entries shorter is rejected whole and every new fact in it is lost): for each fact you add, merge two related entries into one or drop the stalest. Merge only entries that carry the same ~tag, and keep that tag`;
   const fmt = (actor: string, entries: string[]) => {
-    const head = `CURRENT ${actor} MEMORY [${entries.length}/48 entries${entries.length >= 39 ? " — ≥80% FULL, CONSOLIDATE BEFORE ADDING" : ""}]:`;
+    const head = `CURRENT ${actor} MEMORY [${entries.length}/48 entries${entries.length >= 39 ? full(entries.length) : ""}]:`;
     if (entries.length === 0) return [head, "(empty)", ""];
     return [head, ...entries.map((e) => `  ${stripPrivateContent(e)}`).filter((e) => e.trim().length > 0), ""];
   };
@@ -355,21 +360,41 @@ function renderCurrentMemory(snap: CurrentMemorySnapshot | undefined): string[] 
   ];
 }
 
+// Runs fail increasingly above ~30 KB of prompt, and raising the timeout has not
+// moved the rate, so the prompt is bounded instead. The memory block is fixed
+// cost; the exchanges get what is left, oldest dropped first.
+export const PROMPT_BUDGET_CHARS = 30_000;
+const MIN_EXCHANGES_KEPT = 2;
+
 export function buildReviewerUserPrompt(exchanges: Exchange[], currentMemory?: CurrentMemorySnapshot): string {
+  const memory = renderCurrentMemory(currentMemory);
+  const footer = "Curate memory (return the full desired list per file you change via op:\"set\") and extract any idea/knowledge/proposal items. Return JSON only.";
+  const blocks = exchanges.map((ex) => [
+    `${PRINCIPAL_NAME}: ${stripPrivateContent(ex.user)}`,
+    ``,
+    `${DA_NAME}: ${stripPrivateContent(ex.assistant)}`,
+    ``,
+  ]);
+
+  let remaining = PROMPT_BUDGET_CHARS - memory.join("\n").length - footer.length - 200;
+  let first = blocks.length;
+  while (first > 0) {
+    const cost = blocks[first - 1].join("\n").length + 60;
+    if (remaining - cost < 0 && blocks.length - first >= MIN_EXCHANGES_KEPT) break;
+    remaining -= cost;
+    first--;
+  }
+
+  const kept = exchanges.length - first;
   const lines = [
-    ...renderCurrentMemory(currentMemory),
-    `Recent conversation between ${PRINCIPAL_NAME} and ${DA_NAME} (last ` + exchanges.length + " exchanges):",
+    ...memory,
+    `Recent conversation between ${PRINCIPAL_NAME} and ${DA_NAME} (last ${kept} exchanges):`,
     "",
   ];
-  for (let i = 0; i < exchanges.length; i++) {
-    const ex = exchanges[i];
-    lines.push(`--- Exchange ${i + 1} (${ex.ts}) ---`);
-    lines.push(`${PRINCIPAL_NAME}: ${stripPrivateContent(ex.user)}`);
-    lines.push(``);
-    lines.push(`${DA_NAME}: ${stripPrivateContent(ex.assistant)}`);
-    lines.push(``);
+  for (let i = first; i < exchanges.length; i++) {
+    lines.push(`--- Exchange ${i - first + 1} (${exchanges[i].ts}) ---`, ...blocks[i]);
   }
-  lines.push("Curate memory (return the full desired list per file you change via op:\"set\") and extract any idea/knowledge/proposal items. Return JSON only.");
+  lines.push(footer);
   return lines.join("\n");
 }
 

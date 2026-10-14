@@ -44,7 +44,7 @@ import { homedir } from "node:os";
 
 import { add as memoryAdd, sanitizeTypedItemForPersistence, type AddResult } from "./MemorySystem";
 import { read as memoryWriterRead } from "./MemoryWriter";
-import { isKnownType, inferProposalKind, pinProposalTargetFile, type TypedItem } from "./MemoryTypes";
+import { isKnownType, inferProposalKind, pinProposalTargetFile, PENDING_PROPOSALS_PATH, type TypedItem } from "./MemoryTypes";
 import { inference } from "./Inference";
 import { getPrincipalName, getDAName } from "../../hooks/lib/identity";
 import { ingestCaptureEnvelope, stripPrivateContent, type CaptureEnvelope } from "./CaptureEnvelope";
@@ -774,6 +774,37 @@ function hasFlag(flag: string): boolean {
   return process.argv.includes(flag);
 }
 
+async function e2eProbe(): Promise<number> {
+  const synthPath = pathJoin(CLAUDE_ROOT, "LIFEOS/MEMORY/OBSERVABILITY/synth.jsonl");
+  writeFileSync(synthPath, [
+    JSON.stringify({ timestamp: "2026-05-23T22:30:00Z", message: { role: "user", content: `Hey ${DA_NAME}` } }),
+    JSON.stringify({ timestamp: "2026-05-23T22:30:05Z", message: { role: "assistant", content: [{ type: "text", text: `Hey ${PRINCIPAL_NAME}` }] } }),
+  ].join("\n"), "utf8");
+  const r = await review({
+    input: synthPath,
+    turns: 5,
+    mockInferenceResponse: JSON.stringify({
+      items: [
+        { type: "memory", actor: "principal", content: "PREFERENCE: smoke E2E mock" },
+        { type: "proposal", target_file: pathJoin(CLAUDE_ROOT, "LIFEOS/USER/PRINCIPAL/PRINCIPAL_IDENTITY.md"), edit: "RULE: E2E mock", confidence: 0.5, rationale: "smoke" },
+      ],
+    }),
+  });
+  const memory = readFileSync(pathJoin(CLAUDE_ROOT, "LIFEOS/USER/PRINCIPAL/PRINCIPAL_MEMORY.md"), "utf8");
+  const queued = existsSync(PENDING_PROPOSALS_PATH)
+    ? readFileSync(PENDING_PROPOSALS_PATH, "utf8").split("\n").filter((l) => l.includes("RULE: E2E mock")).length
+    : 0;
+  console.log(JSON.stringify({
+    ok: r.ok,
+    total: r.dispatch_summary?.total,
+    succeeded: r.dispatch_summary?.succeeded,
+    failed: r.dispatch_summary?.failed,
+    queued,
+    memoryHasEntry: memory.includes("smoke E2E mock"),
+  }));
+  return 0;
+}
+
 async function smokeTest(): Promise<number> {
   console.log("MemoryReviewer smoke test starting…");
   let pass = 0, fail = 0;
@@ -817,51 +848,41 @@ async function smokeTest(): Promise<number> {
     isGuardRefusal({ ok: false, code: "EWRITE_FAILED", message: "MemoryWriter rejected: ESUSPECT_EROSION — op would net-drop 2 entries" } as AddResult) === true &&
     isGuardRefusal({ ok: false, code: "EWRITE_FAILED", message: "disk full" } as AddResult) === false);
 
-  // 7. End-to-end with mocked inference — full pipeline
-  const mockResponse = JSON.stringify({
-    items: [
-      { type: "memory", actor: "principal", content: "PREFERENCE: smoke E2E mock" },
-      { type: "proposal", target_file: pathJoin(homedir(), ".claude/LIFEOS/USER/PRINCIPAL/PRINCIPAL_IDENTITY.md"), edit: "RULE: E2E mock", confidence: 0.5, rationale: "smoke" },
-    ],
-  });
+  // 7. End-to-end with mocked inference — full pipeline. Dispatch writes the
+  //    hot-layer files and the proposal queue, so it runs in a child process
+  //    whose HOME is a throwaway tree; the live install is never touched.
+  {
+    const { mkdtempSync, rmSync, symlinkSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { spawnSync } = await import("node:child_process");
+    const sandbox = mkdtempSync(pathJoin(tmpdir(), "reviewer-e2e-"));
+    const userData = pathJoin(sandbox, ".config/LIFEOS/USER");
+    const hotLayer = "---\nschema_version: 1\n---\n\n<!-- BEGIN ENTRIES -->\n<!-- END ENTRIES -->\n";
+    mkdirSync(pathJoin(userData, "PRINCIPAL"), { recursive: true });
+    mkdirSync(pathJoin(userData, "DIGITAL_ASSISTANT"), { recursive: true });
+    mkdirSync(pathJoin(userData, "MEMORY/OBSERVABILITY"), { recursive: true });
+    mkdirSync(pathJoin(sandbox, ".claude/LIFEOS"), { recursive: true });
+    writeFileSync(pathJoin(userData, "PRINCIPAL/PRINCIPAL_MEMORY.md"), hotLayer, "utf8");
+    writeFileSync(pathJoin(userData, "DIGITAL_ASSISTANT/DA_MEMORY.md"), hotLayer, "utf8");
+    writeFileSync(pathJoin(userData, "PRINCIPAL/PRINCIPAL_IDENTITY.md"), "# Identity\n", "utf8");
+    symlinkSync(userData, pathJoin(sandbox, ".claude/LIFEOS/USER"));
+    symlinkSync(pathJoin(userData, "MEMORY"), pathJoin(sandbox, ".claude/LIFEOS/MEMORY"));
 
-  // Use a synthetic transcript so we don't depend on real harness state
-  const synthDir = pathJoin(CLAUDE_ROOT, "LIFEOS/MEMORY/OBSERVABILITY/reviewer-test-synth");
-  mkdirSync(synthDir, { recursive: true });
-  const synthPath = pathJoin(synthDir, "synth.jsonl");
-  writeFileSync(synthPath, [
-    JSON.stringify({ timestamp: "2026-05-23T22:30:00Z", message: { role: "user", content: `Hey ${DA_NAME}` } }),
-    JSON.stringify({ timestamp: "2026-05-23T22:30:05Z", message: { role: "assistant", content: [{ type: "text", text: `Hey ${PRINCIPAL_NAME}` }] } }),
-  ].join("\n"), "utf8");
+    const liveQueue = existsSync(PENDING_PROPOSALS_PATH) ? readFileSync(PENDING_PROPOSALS_PATH, "utf8") : null;
+    const { LIFEOS_DIR: _l, LIFEOS_CONFIG_DIR: _c, ...env } = process.env;
+    const child = spawnSync("bun", [import.meta.path, "e2e-probe"], { env: { ...env, HOME: sandbox }, encoding: "utf8" });
+    let probe: { ok: boolean; total?: number; succeeded?: number; failed?: number; queued: number; memoryHasEntry: boolean } | null = null;
+    try { probe = JSON.parse(child.stdout.trim().split("\n").pop() ?? ""); } catch { /* reported below */ }
+    rmSync(sandbox, { recursive: true, force: true });
 
-  const r = await review({
-    input: synthPath,
-    turns: 5,
-    mockInferenceResponse: mockResponse,
-  });
-  check("E2E: review() returns ok", r.ok, `runId=${r.runId}, exchanges=${r.exchanges}`);
-  check("E2E: dispatch ran", r.dispatch_summary !== undefined && r.dispatch_summary.total === 2);
-  check("E2E: memory write succeeded", r.dispatch_summary?.by_type.memory === 1);
-  check("E2E: proposal enqueue succeeded", r.dispatch_summary?.by_type.proposal === 1);
-  check("E2E: zero dispatch failures", r.dispatch_summary?.failed === 0);
-
-  // Cleanup synth transcript + reviewer-runs debug dir for this run
-  try {
-    const { rmSync } = await import("node:fs");
-    rmSync(synthDir, { recursive: true, force: true });
-    rmSync(pathJoin(RUNS_DEBUG_DIR, r.runId), { recursive: true, force: true });
-  } catch { /* ignore */ }
-
-  // Cleanup synthetic memory entry
-  try {
-    const { read: mwRead, setEntries: mwSet } = await import("./MemoryWriter");
-    const PRINCIPAL_MEMORY_PATH = pathJoin(CLAUDE_ROOT, "LIFEOS/USER/PRINCIPAL/PRINCIPAL_MEMORY.md");
-    const cur = mwRead(PRINCIPAL_MEMORY_PATH);
-    if (!("code" in cur)) {
-      const cleaned = cur.entries.filter((e) => !e.includes("smoke E2E mock"));
-      mwSet(PRINCIPAL_MEMORY_PATH, cleaned, { updatedBy: "smoke-test-cleanup" });
-    }
-  } catch { /* ignore */ }
+    check("E2E: review() returns ok", probe?.ok === true, probe ? undefined : `probe exited ${child.status}: ${child.stderr.slice(0, 300)}`);
+    check("E2E: dispatch ran", probe?.total === 2);
+    check("E2E: both writes succeeded", probe?.succeeded === 2 && probe?.failed === 0);
+    check("E2E: memory entry landed in the sandbox", probe?.memoryHasEntry === true);
+    check("E2E: proposal queued in the sandbox", probe?.queued === 1);
+    const liveAfter = existsSync(PENDING_PROPOSALS_PATH) ? readFileSync(PENDING_PROPOSALS_PATH, "utf8") : null;
+    check("E2E: live proposal queue untouched", liveAfter === liveQueue);
+  }
 
   // 8. Real harness transcript — extract some exchanges (read-only probe)
   const realTranscript = findMostRecentTranscript();
@@ -886,6 +907,11 @@ async function main() {
 
   if (cmd === "test") {
     process.exit(await smokeTest());
+  }
+
+  // Child side of the smoke test's E2E step; only meaningful under a sandbox HOME.
+  if (cmd === "e2e-probe") {
+    process.exit(await e2eProbe());
   }
 
   if (cmd === "review") {
